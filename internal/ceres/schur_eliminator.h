@@ -47,6 +47,15 @@
 #include "ceres/internal/export.h"
 #include "ceres/linear_solver.h"
 
+#if defined(CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE) && \
+    CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE
+#if !defined(CERES_PRIVATE_SCHUR_ACCUMULATION_CANDIDATE) || \
+    !CERES_PRIVATE_SCHUR_ACCUMULATION_CANDIDATE
+#error "Private matrix reuse requires the private accumulation candidate"
+#endif
+#include "ceres/private_schur_accumulation.h"
+#endif
+
 namespace ceres::internal {
 
 // Classes implementing the SchurEliminatorBase interface implement
@@ -297,7 +306,13 @@ class CERES_NO_EXPORT SchurEliminator final : public SchurEliminatorBase {
                  const double* b,
                  int row_block_counter,
                  const double* inverse_ete_g,
-                 double* rhs);
+                 double* rhs
+#if defined(CERES_PRIVATE_SCHUR_RHS_CANDIDATE) && \
+    CERES_PRIVATE_SCHUR_RHS_CANDIDATE
+                 ,
+                 bool rhs_is_private
+#endif
+  );
 
   void ChunkOuterProduct(int thread_id,
                          const CompressedRowBlockStructure* bs,
@@ -319,6 +334,11 @@ class CERES_NO_EXPORT SchurEliminator final : public SchurEliminatorBase {
                                int row_block_index,
                                BlockRandomAccessMatrix* lhs);
 
+#if defined(CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE) && \
+    CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE
+  // Values only; all live matrix metadata remains invocation-local.
+  PrivateSchurMatrixScratch private_schur_matrix_scratch_;
+#endif
   int num_threads_;
   ContextImpl* context_;
   int num_eliminate_blocks_;

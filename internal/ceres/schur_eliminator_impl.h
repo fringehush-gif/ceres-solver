@@ -70,11 +70,26 @@
 #include "ceres/invert_psd_matrix.h"
 #include "ceres/map_util.h"
 #include "ceres/parallel_for.h"
+#if defined(CERES_PRIVATE_SCHUR_ACCUMULATION_CANDIDATE) && \
+    CERES_PRIVATE_SCHUR_ACCUMULATION_CANDIDATE
+#include "ceres/private_schur_accumulation.h"
+#if defined(CERES_PRIVATE_SCHUR_RHS_CANDIDATE) && \
+    CERES_PRIVATE_SCHUR_RHS_CANDIDATE
+#include "ceres/private_schur_rhs.h"
+#endif
+#endif
 #include "ceres/schur_eliminator.h"
 #include "ceres/scoped_thread_token.h"
 #include "ceres/small_blas.h"
 #include "ceres/stl_util.h"
 #include "ceres/thread_token_provider.h"
+#if defined(CERES_PRIVATE_SCHUR_RHS_CANDIDATE) && \
+    CERES_PRIVATE_SCHUR_RHS_CANDIDATE
+#if !defined(CERES_PRIVATE_SCHUR_ACCUMULATION_CANDIDATE) || \
+    !CERES_PRIVATE_SCHUR_ACCUMULATION_CANDIDATE
+#error "Private RHS draft requires the original private matrix candidate"
+#endif
+#endif
 
 namespace ceres::internal {
 
@@ -88,6 +103,11 @@ void SchurEliminator<kRowBlockSize, kEBlockSize, kFBlockSize>::Init(
     int num_eliminate_blocks,
     bool assume_full_rank_ete,
     const CompressedRowBlockStructure* bs) {
+#if defined(CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE) && \
+    CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE
+  // A new structural Init is an explicit cache boundary.
+  private_schur_matrix_scratch_.Release();
+#endif
   CHECK_GT(num_eliminate_blocks, 0)
       << "SchurComplementSolver cannot be initialized with "
       << "num_eliminate_blocks = 0.";
@@ -219,6 +239,45 @@ void SchurEliminator<kRowBlockSize, kEBlockSize, kFBlockSize>::Eliminate(
                 });
   }
 
+#if defined(CERES_PRIVATE_SCHUR_ACCUMULATION_CANDIDATE) && \
+    CERES_PRIVATE_SCHUR_ACCUMULATION_CANDIDATE
+  PrivateSchurAccumulation private_accumulation;
+#if defined(CERES_PRIVATE_SCHUR_RHS_CANDIDATE) && \
+    CERES_PRIVATE_SCHUR_RHS_CANDIDATE
+  size_t private_rhs_bytes = 0;
+  const bool rhs_shape_eligible =
+      rhs != nullptr && PrivateSchurRhs::RequiredBytes(
+                            lhs->num_rows(), num_threads_, &private_rhs_bytes);
+  // Reserve RHS storage in the existing 256MiB aggregate private budget.
+  const bool use_private_accumulation =
+      private_accumulation.Init(lhs,
+                                bs->cols,
+                                num_eliminate_blocks_,
+                                num_threads_,
+                                private_rhs_bytes
+#if defined(CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE) && \
+    CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE
+                                ,
+                                &private_schur_matrix_scratch_
+#endif
+      );
+  PrivateSchurRhs private_rhs;
+  const bool use_private_rhs = use_private_accumulation && rhs_shape_eligible &&
+                               private_rhs.Init(lhs->num_rows(), num_threads_);
+#else
+  const bool use_private_accumulation =
+      private_accumulation.Init(lhs,
+                                bs->cols,
+                                num_eliminate_blocks_,
+                                num_threads_
+#if defined(CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE) && \
+    CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE
+                                ,
+                                &private_schur_matrix_scratch_
+#endif
+      );
+#endif
+#endif
   // Eliminate y blocks one chunk at a time.  For each chunk, compute
   // the entries of the normal equations and the gradient vector block
   // corresponding to the y block and then apply Gaussian elimination
@@ -240,6 +299,15 @@ void SchurEliminator<kRowBlockSize, kEBlockSize, kFBlockSize>::Eliminate(
       [&](int thread_id, int i) {
         double* buffer = buffer_.get() + thread_id * buffer_size_;
         const Chunk& chunk = chunks_[i];
+        BlockRandomAccessMatrix* chunk_lhs = lhs;
+#if defined(CERES_PRIVATE_SCHUR_ACCUMULATION_CANDIDATE) && \
+    CERES_PRIVATE_SCHUR_ACCUMULATION_CANDIDATE
+        PrivateSchurAccumulation::WorkerMatrix private_lhs(
+            &private_accumulation, thread_id, lhs->num_rows());
+        if (use_private_accumulation) {
+          chunk_lhs = &private_lhs;
+        }
+#endif
         const int e_block_id = bs->rows[chunk.start].cells.front().block_id;
         const int e_block_size = bs->cols[e_block_id].size;
 
@@ -274,7 +342,7 @@ void SchurEliminator<kRowBlockSize, kEBlockSize, kFBlockSize>::Eliminate(
         // in this chunk (g) and add the outer product of the f_blocks to
         // Schur complement (S += F'F).
         ChunkDiagonalBlockAndGradient(
-            chunk, A, b, chunk.start, &ete, g.data(), buffer, lhs);
+            chunk, A, b, chunk.start, &ete, g.data(), buffer, chunk_lhs);
 
         // Normally one wouldn't compute the inverse explicitly, but
         // e_block_size will typically be a small number like 3, in
@@ -297,14 +365,42 @@ void SchurEliminator<kRowBlockSize, kEBlockSize, kFBlockSize>::Eliminate(
               e_block_size,
               g.data(),
               inverse_ete_g.data());
+#if defined(CERES_PRIVATE_SCHUR_RHS_CANDIDATE) && \
+    CERES_PRIVATE_SCHUR_RHS_CANDIDATE
+          double* chunk_rhs = rhs;
+          if (use_private_rhs) {
+            chunk_rhs = private_rhs.Worker(thread_id);
+            CHECK(chunk_rhs != nullptr);
+          }
+          UpdateRhs(chunk,
+                    A,
+                    b,
+                    chunk.start,
+                    inverse_ete_g.data(),
+                    chunk_rhs,
+                    use_private_rhs);
+#else
           UpdateRhs(chunk, A, b, chunk.start, inverse_ete_g.data(), rhs);
+#endif
         }
 
         // S -= F'E(E'E)^{-1}E'F
         ChunkOuterProduct(
-            thread_id, bs, inverse_ete, buffer, chunk.buffer_layout, lhs);
+            thread_id, bs, inverse_ete, buffer, chunk.buffer_layout, chunk_lhs);
       });
 
+#if defined(CERES_PRIVATE_SCHUR_ACCUMULATION_CANDIDATE) && \
+    CERES_PRIVATE_SCHUR_ACCUMULATION_CANDIDATE
+  if (use_private_accumulation) {
+    private_accumulation.Reduce();
+  }
+#if defined(CERES_PRIVATE_SCHUR_RHS_CANDIDATE) && \
+    CERES_PRIVATE_SCHUR_RHS_CANDIDATE
+  if (use_private_rhs) {
+    private_rhs.Reduce(rhs);
+  }
+#endif
+#endif
   // For rows with no e_blocks, the Schur complement update reduces to
   // S += F'F.
   NoEBlockRowsUpdate(A, b, uneliminated_row_begins_, lhs, rhs);
@@ -389,7 +485,13 @@ void SchurEliminator<kRowBlockSize, kEBlockSize, kFBlockSize>::UpdateRhs(
     const double* b,
     int row_block_counter,
     const double* inverse_ete_g,
-    double* rhs) {
+    double* rhs
+#if defined(CERES_PRIVATE_SCHUR_RHS_CANDIDATE) && \
+    CERES_PRIVATE_SCHUR_RHS_CANDIDATE
+    ,
+    bool rhs_is_private
+#endif
+) {
   const CompressedRowBlockStructure* bs = A.block_structure();
   const double* values = A.values();
 
@@ -414,7 +516,14 @@ void SchurEliminator<kRowBlockSize, kEBlockSize, kFBlockSize>::UpdateRhs(
       const int block_id = row.cells[c].block_id;
       const int block_size = bs->cols[block_id].size;
       const int block = block_id - num_eliminate_blocks_;
+#if defined(CERES_PRIVATE_SCHUR_RHS_CANDIDATE) && \
+    CERES_PRIVATE_SCHUR_RHS_CANDIDATE
+      // Only a successfully allocated, uniquely owned worker RHS skips locking.
+      auto lock = MakeConditionalLock(rhs_is_private ? 1 : num_threads_,
+                                      *rhs_locks_[block]);
+#else
       auto lock = MakeConditionalLock(num_threads_, *rhs_locks_[block]);
+#endif
       // clang-format off
       MatrixTransposeVectorMultiply<kRowBlockSize, kFBlockSize, 1>(
           values + row.cells[c].position,
