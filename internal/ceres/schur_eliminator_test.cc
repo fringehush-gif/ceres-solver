@@ -32,7 +32,9 @@
 
 #include <algorithm>
 #include <memory>
+#include <new>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 #include "Eigen/Dense"
@@ -935,6 +937,146 @@ TEST(PrivateSchurUpperTriangle, FirstSeenBufferOrderStillUsesUpperOutput) {
       }
     }
 }
+
+namespace {
+
+class AllocationFaultMatrix final : public BlockRandomAccessMatrix {
+ public:
+  CellInfo* GetCell(int i, int j, int* r, int* c, int* rs, int* cs) final {
+    if (++calls == fail_on_call) {
+      if (throw_other)
+        throw std::runtime_error("non-allocation target failure");
+      throw std::bad_alloc();
+    }
+    return target.GetCell(i, j, r, c, rs, cs);
+  }
+  void SetZero() final { ADD_FAILURE() << "Init must not zero target values"; }
+  int num_rows() const final { return target.num_rows(); }
+  int num_cols() const final { return target.num_cols(); }
+
+  UpperTriangleSentinel target{0};
+  int calls = 0;
+  int fail_on_call = 0;
+  bool throw_other = false;
+};
+
+bool InitAllocationFault(PrivateSchurAccumulation* accumulation,
+                         AllocationFaultMatrix* target,
+                         const std::vector<Block>& blocks
+#if defined(CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE) && \
+    CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE
+                         ,
+                         PrivateSchurMatrixScratch* scratch = nullptr
+#endif
+) {
+  return accumulation->Init(target,
+                            blocks,
+                            0,
+                            3
+#if defined(CERES_PRIVATE_SCHUR_RHS_CANDIDATE) && \
+    CERES_PRIVATE_SCHUR_RHS_CANDIDATE
+                            ,
+                            0
+#endif
+#if defined(CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE) && \
+    CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE
+                            ,
+                            scratch
+#endif
+  );
+}
+
+void ExpectAllocationTargetUnchanged(const AllocationFaultMatrix& target) {
+  for (int i = 0; i < 3; ++i) {
+    for (int j = 0; j < 3; ++j) {
+      for (double value : target.target.values(i, j)) {
+        EXPECT_EQ(value, 17.25);
+      }
+    }
+  }
+}
+
+}  // namespace
+
+TEST(PrivateSchurAllocationFallback, ClearsPartialStateAndPreservesTarget) {
+  const std::vector<Block> blocks = {{1, 0}, {2, 1}, {3, 3}};
+  for (const int fail_on_call : {1, 3, 9}) {
+    SCOPED_TRACE(fail_on_call);
+    AllocationFaultMatrix target;
+    target.fail_on_call = fail_on_call;
+    PrivateSchurAccumulation accumulation;
+    bool admitted = true;
+    EXPECT_NO_THROW(admitted =
+                        InitAllocationFault(&accumulation, &target, blocks));
+    EXPECT_FALSE(admitted);
+    EXPECT_EQ(target.calls, fail_on_call);
+    ExpectAllocationTargetUnchanged(target);
+
+    // No lookup/cell/entry state may survive the failed initialization.
+    PrivateSchurAccumulation::WorkerMatrix worker(&accumulation, 0, 6);
+    int r, c, rs, cs;
+    EXPECT_EQ(worker.GetCell(0, 0, &r, &c, &rs, &cs), nullptr);
+    accumulation.Reduce();
+    ExpectAllocationTargetUnchanged(target);
+
+    // A new successful Init on the same helper must start from clean state.
+    target.fail_on_call = 0;
+    target.calls = 0;
+    ASSERT_TRUE(InitAllocationFault(&accumulation, &target, blocks));
+    EXPECT_EQ(target.calls, 9);
+    for (int t = 0; t < 3; ++t) {
+      PrivateSchurAccumulation::WorkerMatrix current(&accumulation, t, 6);
+      auto* cell = current.GetCell(0, 0, &r, &c, &rs, &cs);
+      ASSERT_NE(cell, nullptr);
+      EXPECT_EQ(cell->values[0], 0.0);
+    }
+    accumulation.Reduce();
+    ExpectAllocationTargetUnchanged(target);
+  }
+}
+
+TEST(PrivateSchurAllocationFallback, DoesNotSwallowOtherExceptions) {
+  AllocationFaultMatrix target;
+  target.fail_on_call = 3;
+  target.throw_other = true;
+  PrivateSchurAccumulation accumulation;
+  EXPECT_THROW(
+      InitAllocationFault(&accumulation, &target, {{1, 0}, {2, 1}, {3, 3}}),
+      std::runtime_error);
+  ExpectAllocationTargetUnchanged(target);
+}
+
+#if defined(CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE) && \
+    CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE
+TEST(PrivateSchurAllocationFallback, ReleasesBorrowedNumericCapacity) {
+  const std::vector<Block> blocks = {{1, 0}, {2, 1}, {3, 3}};
+  PrivateSchurMatrixScratch scratch;
+  AllocationFaultMatrix seed;
+  {
+    PrivateSchurAccumulation accumulation;
+    ASSERT_TRUE(InitAllocationFault(&accumulation, &seed, blocks, &scratch));
+  }
+  ASSERT_GT(scratch.capacity_scalars(), 0);
+  ASSERT_NE(scratch.data(), nullptr);
+  ExpectAllocationTargetUnchanged(seed);
+
+  AllocationFaultMatrix fault;
+  fault.fail_on_call = 3;
+  {
+    PrivateSchurAccumulation accumulation;
+    EXPECT_FALSE(InitAllocationFault(&accumulation, &fault, blocks, &scratch));
+    EXPECT_EQ(scratch.capacity_scalars(), 0);
+    EXPECT_EQ(scratch.data(), nullptr);
+    PrivateSchurAccumulation::WorkerMatrix worker(&accumulation, 0, 6);
+    int r, c, rs, cs;
+    EXPECT_EQ(worker.GetCell(0, 0, &r, &c, &rs, &cs), nullptr);
+    accumulation.Reduce();
+  }
+  EXPECT_EQ(scratch.capacity_scalars(), 0);
+  EXPECT_EQ(scratch.data(), nullptr);
+  ExpectAllocationTargetUnchanged(fault);
+}
+#endif
 
 #if defined(CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE) && \
     CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE

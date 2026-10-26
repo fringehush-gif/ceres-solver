@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <memory>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -60,7 +61,7 @@ class CERES_NO_EXPORT PrivateSchurAccumulation {
             ,
             PrivateSchurMatrixScratch* scratch = nullptr
 #endif
-  ) {
+            ) try {
 #if defined(CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE) && \
     CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE
     // Reinitializing a direct helper also ends its previous invocation.
@@ -200,6 +201,16 @@ class CERES_NO_EXPORT PrivateSchurAccumulation {
     admission_guard.admitted = true;
 #endif
     return true;
+  } catch (const std::bad_alloc&) {
+    // Init has not written target values. Drop partial metadata and any
+    // borrowed numeric storage before selecting ordinary locked accumulation.
+#if defined(CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE) && \
+    CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE
+    AbandonNumericCapacity();
+#else
+    ResetCallMetadata();
+#endif
+    return false;
   }
 
   class CERES_NO_EXPORT WorkerMatrix final : public BlockRandomAccessMatrix {
@@ -268,16 +279,6 @@ class CERES_NO_EXPORT PrivateSchurAccumulation {
     admitted_ = false;
     value_capacity_scalars_ = 0;
   }
-  void ResetCallMetadata() {
-    // CellInfo contains mutexes; reconstruct it per invocation. Targets and
-    // layout/lookup capacities do not belong to the persistent numeric cache.
-    cells_.reset();
-    values_.reset();
-    std::vector<int>().swap(lookup_);
-    std::vector<Entry>().swap(entries_);
-    num_blocks_ = scalar_count_ = 0;
-    num_threads_ = 0;
-  }
   void AbandonNumericCapacity() {
     values_.reset();
     scratch_ = nullptr;
@@ -295,6 +296,16 @@ class CERES_NO_EXPORT PrivateSchurAccumulation {
   size_t value_capacity_scalars_ = 0;
   bool admitted_ = false;
 #endif
+  void ResetCallMetadata() {
+    // CellInfo contains mutexes; reconstruct it per invocation. Targets and
+    // layout/lookup capacities do not belong to the persistent numeric cache.
+    cells_.reset();
+    values_.reset();
+    std::vector<int>().swap(lookup_);
+    std::vector<Entry>().swap(entries_);
+    num_blocks_ = scalar_count_ = 0;
+    num_threads_ = 0;
+  }
   struct CERES_NO_EXPORT Entry {
     CellInfo* target = nullptr;
     int row = 0, col = 0, row_stride = 0, col_stride = 0;
