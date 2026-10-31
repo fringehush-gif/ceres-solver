@@ -103,11 +103,6 @@ void SchurEliminator<kRowBlockSize, kEBlockSize, kFBlockSize>::Init(
     int num_eliminate_blocks,
     bool assume_full_rank_ete,
     const CompressedRowBlockStructure* bs) {
-#if defined(CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE) && \
-    CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE
-  // A new structural Init is an explicit cache boundary.
-  private_schur_matrix_scratch_.Release();
-#endif
   CHECK_GT(num_eliminate_blocks, 0)
       << "SchurComplementSolver cannot be initialized with "
       << "num_eliminate_blocks = 0.";
@@ -249,33 +244,14 @@ void SchurEliminator<kRowBlockSize, kEBlockSize, kFBlockSize>::Eliminate(
       rhs != nullptr && PrivateSchurRhs::RequiredBytes(
                             lhs->num_rows(), num_threads_, &private_rhs_bytes);
   // Reserve RHS storage in the existing 256MiB aggregate private budget.
-  const bool use_private_accumulation =
-      private_accumulation.Init(lhs,
-                                bs->cols,
-                                num_eliminate_blocks_,
-                                num_threads_,
-                                private_rhs_bytes
-#if defined(CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE) && \
-    CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE
-                                ,
-                                &private_schur_matrix_scratch_
-#endif
-      );
+  const bool use_private_accumulation = private_accumulation.Init(
+      lhs, bs->cols, num_eliminate_blocks_, num_threads_, private_rhs_bytes);
   PrivateSchurRhs private_rhs;
   const bool use_private_rhs = use_private_accumulation && rhs_shape_eligible &&
                                private_rhs.Init(lhs->num_rows(), num_threads_);
 #else
-  const bool use_private_accumulation =
-      private_accumulation.Init(lhs,
-                                bs->cols,
-                                num_eliminate_blocks_,
-                                num_threads_
-#if defined(CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE) && \
-    CERES_PRIVATE_SCHUR_MATRIX_REUSE_CANDIDATE
-                                ,
-                                &private_schur_matrix_scratch_
-#endif
-      );
+  const bool use_private_accumulation = private_accumulation.Init(
+      lhs, bs->cols, num_eliminate_blocks_, num_threads_);
 #endif
 #endif
   // Eliminate y blocks one chunk at a time.  For each chunk, compute
